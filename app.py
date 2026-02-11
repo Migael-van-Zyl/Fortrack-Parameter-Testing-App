@@ -51,8 +51,8 @@ RF_BASE = {
 ARIMA_BASE = (1, 0, 1)
 SARIMA_BASE = (1, 1, 0, 12)
 
-DEFAULT_TEST_HORIZON = 12     # (Migael’s requirement)
-MIN_LAGS = 12                 # we build 12 lags
+DEFAULT_TEST_HORIZON = 12     # 12-month horizon
+MIN_LAGS = 12                 # build 12 lags
 
 # ---------------------------------------------------------------------
 # HELPERS
@@ -249,10 +249,10 @@ with tab1:
     selected = c1.selectbox("Select PoD", pods, index=st.session_state.pod_idx)
     if c2.button("Prev"):
         st.session_state.pod_idx = (st.session_state.pod_idx - 1) % len(pods)
-        st.experimental_rerun()  # safe in older Streamlit; still works in newer
+        st.rerun()
     if c3.button("Next"):
         st.session_state.pod_idx = (st.session_state.pod_idx + 1) % len(pods)
-        st.experimental_rerun()
+        st.rerun()
 
     monthly = pod_monthly(df, selected)
     if monthly.empty:
@@ -412,7 +412,7 @@ with tab2:
                         model = sm.tsa.SARIMAX(
                             y_train,
                             order=(p, d, q),
-                            seasonal_order=SARIMA_BASE,  # keep seasonal part same as original code
+                            seasonal_order=SARIMA_BASE,  # retains 12M seasonality
                             trend=trend,
                             enforce_stationarity=False,
                             enforce_invertibility=False,
