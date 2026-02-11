@@ -13,17 +13,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import statsmodels.api as sm
-
-# -----------------------------------------------------------------------------
-# Optional: XGBoost
-# -----------------------------------------------------------------------------
-try:
-    from xgboost import XGBRegressor
-    HAS_XGB = True
-except Exception:
-    XGBRegressor = None
-    HAS_XGB = False
 
 from sklearn.ensemble import RandomForestRegressor
 
@@ -31,6 +20,7 @@ from sklearn.ensemble import RandomForestRegressor
 # Streamlit Page Setup
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="PoD Forecast Playground", page_icon="📈", layout="wide")
+st.caption("✅ App initialized — select a PoD and run a model.")
 
 # -----------------------------------------------------------------------------
 # CONSTANTS & BASELINES
@@ -65,48 +55,65 @@ DEFAULT_TEST_HORIZON = 12
 # HELPERS
 # -----------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
-def load_csv(file):
+def load_csv(file: st.runtime.uploaded_file_manager.UploadedFile) -> pd.DataFrame:
     df = pd.read_csv(file, dtype=str)
+    if "ReportingMonth" not in df.columns or "PodID" not in df.columns:
+        raise ValueError("CSV must contain 'ReportingMonth' and 'PodID' columns.")
     df["ReportingMonth"] = pd.to_datetime(df["ReportingMonth"], errors="coerce")
     for c in MEASURES:
+        if c not in df.columns:
+            raise ValueError(f"Missing required measure column: {c}")
         df[c] = pd.to_numeric(df[c].astype(str).str.replace(",", "", regex=False), errors="coerce")
     return df.dropna(subset=["ReportingMonth", "PodID"])
 
-def to_month_end(series: pd.Series):
+def to_month_end(series: pd.Series) -> pd.Series:
+    """Normalize timestamps to month-end without reindexing (prevents mass NaNs)."""
     idx = series.index.to_period("M").to_timestamp(how="end")
     s = pd.Series(series.values, index=idx)
     return s.groupby(s.index).sum(min_count=1).sort_index()
 
-def rmse(y_true, y_pred):
-    return float(np.sqrt(np.nanmean((np.asarray(y_true)-np.asarray(y_pred))**2)))
+def rmse(y_true, y_pred) -> float:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    return float(np.sqrt(np.nanmean((y_true - y_pred) ** 2)))
 
-def mape_percent(y_true, y_pred):
-    y_true = np.asarray(y_true); y_pred = np.asarray(y_pred)
+def mape_percent(y_true, y_pred) -> float:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
     denom = np.where(y_true == 0, np.nan, y_true)
-    return float(np.nanmean(np.abs((y_true - y_pred) / denom)) * 100)
+    return float(np.nanmean(np.abs((y_true - y_pred) / denom)) * 100.0)
 
 def plot_series(ax, dates, actual, pred, title, label_pred):
     ax.plot(dates, actual, label="Actual", color="black", linewidth=2)
     ax.plot(dates, pred, label=label_pred, color="#1f77b4")
     ax.set_title(title)
+    ax.set_xlabel("Month")
+    ax.set_ylabel("Consumption (kWh)")
     ax.grid(alpha=0.3)
     ax.legend()
 
-def clean_preview_series(y, mask_negatives=True, ffill=3):
+def clean_preview_series(y: pd.Series, mask_negatives=True, ffill=3) -> pd.Series:
+    """Light preview cleaning. ARIMA/SARIMA use their own gentle cleaning flow."""
     z = y.copy()
-    if mask_negatives: z = z.mask(z < 0, np.nan)
+    if mask_negatives:
+        z = z.mask(z < 0, np.nan)
     z = to_month_end(z)
     return z.ffill(limit=ffill).bfill(limit=ffill)
 
-def build_supervised(series, mask_negatives=True):
+def build_supervised(series: pd.Series, mask_negatives=True) -> pd.DataFrame:
     s = series.mask(series < 0, np.nan) if mask_negatives else series.copy()
     df = pd.DataFrame(index=s.index); df["y"] = s
     for L in range(1, 13):
         df[f"lag{L}"] = s.shift(L)
     return df.dropna()
 
-def prepare_xy(series, horizon, mask_negatives=True):
+def prepare_xy(series: pd.Series, horizon: int, mask_negatives=True):
     df_sup = build_supervised(series, mask_negatives)
+    if len(df_sup) <= horizon:
+        raise ValueError(
+            f"Not enough rows after lagging ({len(df_sup)}) for test horizon={horizon}. "
+            f"Need at least 12 + horizon months."
+        )
     train = df_sup.iloc[:-horizon]
     test  = df_sup.iloc[-horizon:]
     return (
@@ -117,15 +124,19 @@ def prepare_xy(series, horizon, mask_negatives=True):
         test.index,
     )
 
-def pod_monthly(df, pod):
-    return df[df["PodID"] == pod].groupby("ReportingMonth")[MEASURES].sum(min_count=1).sort_index()
+@st.cache_data(show_spinner=False)
+def pod_monthly(df: pd.DataFrame, pod_id: str) -> pd.DataFrame:
+    d = df[df["PodID"] == pod_id]
+    if d.empty:
+        return pd.DataFrame()
+    return d.groupby("ReportingMonth")[MEASURES].sum(min_count=1).sort_index()
 
 # -----------------------------------------------------------------------------
 # SIDEBAR
 # -----------------------------------------------------------------------------
 st.sidebar.title("⚙️ Settings")
 file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
-test_horizon = st.sidebar.slider("Test horizon", 6, 24, DEFAULT_TEST_HORIZON)
+test_horizon = st.sidebar.slider("Test horizon (months)", 6, 24, DEFAULT_TEST_HORIZON)
 mask_negatives = st.sidebar.checkbox("Mask negative values", True)
 ffill_limit = st.sidebar.slider("Short forward/backfill limit", 0, 12, 3)
 
@@ -135,13 +146,17 @@ ffill_limit = st.sidebar.slider("Short forward/backfill limit", 0, 12, 3)
 st.title("📈 PoD Forecast Playground")
 
 if not file:
-    st.info("Upload `industrial_10yrs.csv` to proceed.")
+    st.info("Upload `industrial_10yrs.csv` (or your dataset) to proceed.")
     st.stop()
 
 # Load data
-df = load_csv(file)
-pods = sorted(df["PodID"].unique())
+try:
+    df = load_csv(file)
+except Exception as ex:
+    st.error(f"Failed to load CSV: {ex}")
+    st.stop()
 
+pods = sorted(df["PodID"].unique().tolist())
 if "pod_idx" not in st.session_state:
     st.session_state.pod_idx = 0
 
@@ -173,7 +188,8 @@ with tab_explore:
         fig, ax = plt.subplots(figsize=(12,5))
         for m in MEASURES:
             ax.plot(monthly.index, monthly[m], label=m)
-        ax.set_title(f"PoD {selected_pod}")
+        ax.set_title(f"PoD {selected_pod} – Monthly Consumption")
+        ax.set_xlabel("Month"); ax.set_ylabel("kWh")
         ax.grid(alpha=0.3); ax.legend()
         st.pyplot(fig, clear_figure=True)
 
@@ -193,8 +209,9 @@ with tab_models:
     series_clean = clean_preview_series(series_raw, mask_negatives, ffill=ffill_limit)
     with st.expander("Show Cleaned Preview"):
         fig, ax = plt.subplots(figsize=(12,3))
-        ax.plot(series_raw.index, series_raw, label="Raw", alpha=0.6)
-        ax.plot(series_clean.index, series_clean, label="Normalized", color="black")
+        ax.plot(series_raw.index, series_raw.values, label="Raw", alpha=0.6)
+        ax.plot(series_clean.index, series_clean.values, label="Normalized Preview", color="black")
+        ax.set_title(f"{pod_for_model} / {measure}")
         ax.grid(alpha=0.3); ax.legend()
         st.pyplot(fig, clear_figure=True)
 
@@ -202,20 +219,24 @@ with tab_models:
     tab_xgb, tab_rf, tab_arima, tab_sarima = st.tabs(["🌲 XGBoost", "🌳 Random Forest", "📐 ARIMA", "📏 Full SARIMA"])
 
     # ===========================================
-    # XGBOOST
+    # XGBOOST (lazy import inside button)
     # ===========================================
     with tab_xgb:
-        if not HAS_XGB:
-            st.info("Install xgboost to use this model.")
-        else:
-            col1, col2, col3 = st.columns(3)
-            n_est = col1.slider("n_estimators", 50, 1000, XGB_BASE["n_estimators"], 50, key="xgb_n")
-            max_depth = col1.slider("max_depth", 2, 15, XGB_BASE["max_depth"], 1, key="xgb_d")
-            lr = col2.slider("learning_rate", 0.01, 0.5, float(XGB_BASE["learning_rate"]), 0.01, key="xgb_lr")
-            subs = col2.slider("subsample", 0.5, 1.0, float(XGB_BASE["subsample"]), 0.05, key="xgb_s")
-            colsample = col3.slider("colsample_bytree", 0.5, 1.0, float(XGB_BASE["colsample_bytree"]), 0.05, key="xgb_cs")
+        col1, col2, col3 = st.columns(3)
+        n_est = col1.slider("n_estimators", 50, 1000, XGB_BASE["n_estimators"], 50, key="xgb_n")
+        max_depth = col1.slider("max_depth", 2, 15, XGB_BASE["max_depth"], 1, key="xgb_d")
+        lr = col2.slider("learning_rate", 0.01, 0.5, float(XGB_BASE["learning_rate"]), 0.01, key="xgb_lr")
+        subs = col2.slider("subsample", 0.5, 1.0, float(XGB_BASE["subsample"]), 0.05, key="xgb_s")
+        colsample = col3.slider("colsample_bytree", 0.5, 1.0, float(XGB_BASE["colsample_bytree"]), 0.05, key="xgb_cs")
 
-            if st.button("Run XGBoost"):
+        if st.button("Run XGBoost"):
+            try:
+                try:
+                    from xgboost import XGBRegressor  # lazy import
+                except Exception as ex:
+                    st.error(f"`xgboost` not available: {ex}")
+                    st.stop()
+
                 X_train, y_train, X_test, y_test, dates = prepare_xy(series_raw, test_horizon, mask_negatives)
                 model = XGBRegressor(
                     n_estimators=n_est, max_depth=max_depth, learning_rate=lr,
@@ -232,6 +253,9 @@ with tab_models:
                 colA.metric("RMSE", f"{rmse(y_test,pred):,.2f}")
                 colB.metric("MAPE", f"{mape_percent(y_test,pred):.2f}%")
 
+            except Exception as ex:
+                st.error(f"XGBoost run failed: {ex}")
+
     # ===========================================
     # RANDOM FOREST
     # ===========================================
@@ -245,25 +269,29 @@ with tab_models:
         boot = col3.checkbox("bootstrap", RF_BASE["bootstrap"], key="rf_boot")
 
         if st.button("Run Random Forest"):
-            X_train, y_train, X_test, y_test, dates = prepare_xy(series_raw, test_horizon, mask_negatives)
-            model = RandomForestRegressor(
-                n_estimators=n_est, max_depth=max_depth,
-                min_samples_split=min_split, min_samples_leaf=min_leaf,
-                max_features=max_feat, bootstrap=boot, random_state=42, n_jobs=-1
-            )
-            model.fit(X_train, y_train)
-            pred = model.predict(X_test)
+            try:
+                X_train, y_train, X_test, y_test, dates = prepare_xy(series_raw, test_horizon, mask_negatives)
+                model = RandomForestRegressor(
+                    n_estimators=n_est, max_depth=max_depth,
+                    min_samples_split=min_split, min_samples_leaf=min_leaf,
+                    max_features=max_feat, bootstrap=boot, random_state=42, n_jobs=-1
+                )
+                model.fit(X_train, y_train)
+                pred = model.predict(X_test)
 
-            fig, ax = plt.subplots(figsize=(12,4))
-            plot_series(ax, dates, y_test, pred, "Random Forest Forecast", f"depth={max_depth}, est={n_est}")
-            st.pyplot(fig)
+                fig, ax = plt.subplots(figsize=(12,4))
+                plot_series(ax, dates, y_test, pred, "Random Forest Forecast", f"depth={max_depth}, est={n_est}")
+                st.pyplot(fig)
 
-            colA, colB = st.columns(2)
-            colA.metric("RMSE", f"{rmse(y_test,pred):,.2f}")
-            colB.metric("MAPE", f"{mape_percent(y_test,pred):.2f}%")
+                colA, colB = st.columns(2)
+                colA.metric("RMSE", f"{rmse(y_test,pred):,.2f}")
+                colB.metric("MAPE", f"{mape_percent(y_test,pred):,.2f}%")
+
+            except Exception as ex:
+                st.error(f"Random Forest run failed: {ex}")
 
     # ===========================================
-    # ARIMA
+    # ARIMA (lazy import inside button)
     # ===========================================
     with tab_arima:
         col1, col2, col3 = st.columns(3)
@@ -273,41 +301,54 @@ with tab_models:
 
         trend = st.selectbox("Trend", ["none", "c", "t"], index=1, key="arima_trend")
         trend = None if trend == "none" else trend
-
         use_log = st.checkbox("Use log1p transform", False, key="arima_log")
 
         if st.button("Run ARIMA"):
-            y = to_month_end(series_raw)
-            if mask_negatives: y = y.mask(y<0, np.nan)
-            y = y.ffill(limit=ffill_limit).bfill(limit=ffill_limit)
+            try:
+                import statsmodels.api as sm  # lazy import
 
-            y_mod = np.log1p(np.clip(y,0,None)) if use_log else y
+                y = to_month_end(series_raw)
+                if mask_negatives:
+                    y = y.mask(y < 0, np.nan)
+                y = y.ffill(limit=ffill_limit).bfill(limit=ffill_limit)
 
-            y_train = y_mod.iloc[:-test_horizon]
-            y_test  = y.iloc[-test_horizon:]
+                y_mod = np.log1p(np.clip(y, 0, None)) if use_log else y
 
-            model = sm.tsa.SARIMAX(
-                y_train, order=(p,d,q), seasonal_order=SARIMA_BASE,
-                trend=trend, enforce_stationarity=False, enforce_invertibility=False,
-                initialization="approximate_diffuse"
-            )
-            res = model.fit(disp=False,maxiter=500)
-            fc = res.get_forecast(test_horizon).predicted_mean
+                if len(y_mod) <= test_horizon + 24:
+                    st.warning("Series may be short for stable ARIMA; results could be noisy.")
 
-            pred = np.expm1(fc) if use_log else fc
-            pred = np.asarray(pred.values,float)
+                y_train = y_mod.iloc[:-test_horizon]
+                y_test  = y.iloc[-test_horizon:]
 
-            fig, ax = plt.subplots(figsize=(12,4))
-            plot_series(ax, y_test.index, y_test.values, pred,
-                        "ARIMA Forecast", f"({p},{d},{q}), trend={trend}")
-            st.pyplot(fig)
+                model = sm.tsa.SARIMAX(
+                    y_train,
+                    order=(p, d, q),
+                    seasonal_order=SARIMA_BASE,
+                    trend=trend,
+                    enforce_stationarity=False,
+                    enforce_invertibility=False,
+                    initialization="approximate_diffuse",
+                )
+                res = model.fit(disp=False, maxiter=500)
+                fc = res.get_forecast(test_horizon).predicted_mean
 
-            colA, colB = st.columns(2)
-            colA.metric("RMSE", f"{rmse(y_test,pred):,.2f}")
-            colB.metric("MAPE", f"{mape_percent(y_test,pred):.2f}%")
+                pred = np.expm1(fc) if use_log else fc
+                pred = np.asarray(pred.values, dtype=float)
+
+                fig, ax = plt.subplots(figsize=(12,4))
+                plot_series(ax, y_test.index, y_test.values, pred,
+                            "ARIMA Forecast", f"({p},{d},{q}), trend={trend or 'None'}")
+                st.pyplot(fig)
+
+                colA, colB = st.columns(2)
+                colA.metric("RMSE", f"{rmse(y_test,pred):,.2f}")
+                colB.metric("MAPE", f"{mape_percent(y_test,pred):,.2f}%")
+
+            except Exception as ex:
+                st.error(f"ARIMA run failed: {ex}")
 
     # ===========================================
-    # FULL SARIMA: (p,d,q,P,D,Q,s)
+    # FULL SARIMA: (p,d,q,P,D,Q,s) (lazy import inside button)
     # ===========================================
     with tab_sarima:
         st.markdown("### Full SARIMA Model")
@@ -323,42 +364,53 @@ with tab_models:
         Q_s = c6.slider("Q", 0, 10, SARIMA_BASE[2], 1, key="sarima_Q")
         s_s = c7.slider("s", 6, 24, SARIMA_BASE[3], 1, key="sarima_s")
 
-        trend_s = st.selectbox("Trend", ["none","c","t"], index=1, key="sarima_trend")
+        trend_s = st.selectbox("Trend", ["none", "c", "t"], index=1, key="sarima_trend")
         trend_s = None if trend_s == "none" else trend_s
-
         use_log_s = st.checkbox("Use log1p transform", False, key="sarima_log")
 
         if st.button("Run SARIMA"):
-            y = to_month_end(series_raw)
-            if mask_negatives: y = y.mask(y<0, np.nan)
-            y = y.ffill(limit=ffill_limit).bfill(limit=ffill_limit)
+            try:
+                import statsmodels.api as sm  # lazy import
 
-            y_mod = np.log1p(np.clip(y,0,None)) if use_log_s else y
+                y = to_month_end(series_raw)
+                if mask_negatives:
+                    y = y.mask(y < 0, np.nan)
+                y = y.ffill(limit=ffill_limit).bfill(limit=ffill_limit)
 
-            y_train = y_mod.iloc[:-test_horizon]
-            y_test  = y.iloc[-test_horizon:]
+                y_mod = np.log1p(np.clip(y, 0, None)) if use_log_s else y
 
-            model = sm.tsa.SARIMAX(
-                y_train,
-                order=(p_s,d_s,q_s),
-                seasonal_order=(P_s,D_s,Q_s,s_s),
-                trend=trend_s,
-                enforce_stationarity=False,
-                enforce_invertibility=False,
-                initialization="approximate_diffuse",
-            )
-            res = model.fit(disp=False,maxiter=500)
-            fc = res.get_forecast(test_horizon).predicted_mean
+                if len(y_mod) <= test_horizon + 24:
+                    st.warning("Series may be short for stable SARIMA; results could be noisy.")
 
-            pred = np.expm1(fc) if use_log_s else fc
-            pred = np.asarray(pred.values,float)
+                y_train = y_mod.iloc[:-test_horizon]
+                y_test  = y.iloc[-test_horizon:]
 
-            fig, ax = plt.subplots(figsize=(12,4))
-            plot_series(ax, y_test.index, y_test.values, pred,
-                        "SARIMA Forecast",
-                        f"({p_s},{d_s},{q_s}) x ({P_s},{D_s},{Q_s},{s_s}) trend={trend_s}")
-            st.pyplot(fig)
+                model = sm.tsa.SARIMAX(
+                    y_train,
+                    order=(p_s, d_s, q_s),
+                    seasonal_order=(P_s, D_s, Q_s, s_s),
+                    trend=trend_s,
+                    enforce_stationarity=False,
+                    enforce_invertibility=False,
+                    initialization="approximate_diffuse",
+                )
+                res = model.fit(disp=False, maxiter=500)
+                fc = res.get_forecast(test_horizon).predicted_mean
 
-            colA, colB = st.columns(2)
-            colA.metric("RMSE", f"{rmse(y_test,pred):,.2f}")
-            colB.metric("MAPE", f"{mape_percent(y_test,pred):.2f}%")
+                pred = np.expm1(fc) if use_log_s else fc
+                pred = np.asarray(pred.values, dtype=float)
+
+                fig, ax = plt.subplots(figsize=(12,4))
+                plot_series(
+                    ax, y_test.index, y_test.values, pred,
+                    "SARIMA Forecast",
+                    f"({p_s},{d_s},{q_s}) x ({P_s},{D_s},{Q_s},{s_s}), trend={trend_s or 'None'}"
+                )
+                st.pyplot(fig)
+
+                colA, colB = st.columns(2)
+                colA.metric("RMSE", f"{rmse(y_test,pred):,.2f}")
+                colB.metric("MAPE", f"{mape_percent(y_test,pred):,.2f}%")
+
+            except Exception as ex:
+                st.error(f"SARIMA run failed: {ex}")
