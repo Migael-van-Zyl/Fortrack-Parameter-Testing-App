@@ -9,6 +9,8 @@ Date: 2026-02-10
 import warnings
 warnings.filterwarnings("ignore")
 
+import io
+import math
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -20,7 +22,7 @@ from sklearn.ensemble import RandomForestRegressor
 # Streamlit Page Setup
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="PoD Forecast Playground", page_icon="📈", layout="wide")
-st.caption("✅ App initialized — select a PoD and run a model.")
+st.caption("✅ App initialized — select a data source, PoD and model to run.")
 
 # -----------------------------------------------------------------------------
 # CONSTANTS & BASELINES
@@ -54,17 +56,65 @@ DEFAULT_TEST_HORIZON = 12
 # -----------------------------------------------------------------------------
 # HELPERS
 # -----------------------------------------------------------------------------
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Trim spaces and unify exact expected column names if they differ only by case/spacing."""
+    df = df.copy()
+    df.columns = [c.strip() for c in df.columns]
+    # Try gentle normalization (case-insensitive exact matches)
+    colmap = {c.lower(): c for c in df.columns}
+    required = ["podid", "reportingmonth"] + [m.lower() for m in MEASURES]
+    missing = [r for r in required if r not in colmap]
+    # If case-insensitive names exist, reassign to our canonical names
+    canon_map = {}
+    for name in ["PodID", "ReportingMonth"] + MEASURES:
+        low = name.lower()
+        if low in colmap:
+            canon_map[colmap[low]] = name
+    if canon_map:
+        df = df.rename(columns=canon_map)
+    return df
+
 @st.cache_data(show_spinner=False)
-def load_csv(file: st.runtime.uploaded_file_manager.UploadedFile) -> pd.DataFrame:
-    df = pd.read_csv(file, dtype=str)
-    if "ReportingMonth" not in df.columns or "PodID" not in df.columns:
-        raise ValueError("CSV must contain 'ReportingMonth' and 'PodID' columns.")
-    df["ReportingMonth"] = pd.to_datetime(df["ReportingMonth"], errors="coerce")
-    for c in MEASURES:
-        if c not in df.columns:
-            raise ValueError(f"Missing required measure column: {c}")
-        df[c] = pd.to_numeric(df[c].astype(str).str.replace(",", "", regex=False), errors="coerce")
-    return df.dropna(subset=["ReportingMonth", "PodID"])
+def load_anyfile_cached(file_bytes: bytes, filename: str) -> pd.DataFrame:
+    """
+    Robust loader: handles CSV/TXT (any delimiter), Excel (xlsx/xls), and zipped CSV.
+    Returns raw DataFrame with strings in measure cols; downstream will convert.
+    """
+    name = (filename or "").lower()
+    bio = io.BytesIO(file_bytes)
+
+    # Try Excel
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        try:
+            df = pd.read_excel(bio, dtype=str)  # requires openpyxl/xlrd depending on format
+            return _normalize_columns(df)
+        except Exception as ex:
+            raise RuntimeError(f"Failed to read Excel file. Try saving as CSV. Details: {ex}")
+
+    # Try zipped CSV
+    if name.endswith(".zip"):
+        try:
+            df = pd.read_csv(bio, dtype=str, compression="zip", engine="python")
+            return _normalize_columns(df)
+        except Exception as ex:
+            raise RuntimeError(f"Failed to read zipped CSV. Details: {ex}")
+
+    # Default: CSV/TXT with delimiter sniffing
+    try:
+        # Python engine + sep=None to sniff delimiters (comma/semicolon/tab)
+        df = pd.read_csv(bio, dtype=str, sep=None, engine="python", on_bad_lines="skip")
+        return _normalize_columns(df)
+    except Exception as ex:
+        # Fallback encodings
+        for enc in ("utf-8", "latin1"):
+            try:
+                bio.seek(0)
+                df = pd.read_csv(bio, dtype=str, sep=None, engine="python",
+                                 on_bad_lines="skip", encoding=enc)
+                return _normalize_columns(df)
+            except Exception:
+                continue
+        raise RuntimeError(f"Failed to read as CSV/TXT. Tip: Save as UTF-8 CSV. Details: {ex}")
 
 def to_month_end(series: pd.Series) -> pd.Series:
     """Normalize timestamps to month-end without reindexing (prevents mass NaNs)."""
@@ -125,35 +175,126 @@ def prepare_xy(series: pd.Series, horizon: int, mask_negatives=True):
     )
 
 @st.cache_data(show_spinner=False)
+def postload_clean(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure required columns exist, convert types.
+    Returns a cleaned DataFrame suitable for the app.
+    """
+    if df.empty:
+        raise ValueError("Uploaded file is empty.")
+
+    # Normalize names and check required columns
+    df = _normalize_columns(df)
+    missing_cols = []
+    for name in ["PodID", "ReportingMonth"] + MEASURES:
+        if name not in df.columns:
+            missing_cols.append(name)
+    if missing_cols:
+        cols_str = ", ".join(missing_cols)
+        have_str = ", ".join(df.columns)
+        raise ValueError(
+            f"Missing required column(s): {cols_str}.\n"
+            f"Found columns: {have_str}\n"
+            f"Tip: Make sure your headers match exactly (case‑insensitive is OK; we'll map)."
+        )
+
+    # Types
+    df["ReportingMonth"] = pd.to_datetime(df["ReportingMonth"], errors="coerce")
+    for c in MEASURES:
+        # Remove commas if present, then parse numeric
+        df[c] = pd.to_numeric(df[c].astype(str).str.replace(",", "", regex=False), errors="coerce")
+
+    df = df.dropna(subset=["ReportingMonth", "PodID"]).copy()
+    return df
+
+@st.cache_data(show_spinner=False)
 def pod_monthly(df: pd.DataFrame, pod_id: str) -> pd.DataFrame:
     d = df[df["PodID"] == pod_id]
     if d.empty:
         return pd.DataFrame()
     return d.groupby("ReportingMonth")[MEASURES].sum(min_count=1).sort_index()
 
+def fmt_mb(nbytes: int) -> str:
+    if nbytes is None or math.isnan(nbytes): return "-"
+    return f"{nbytes/1024/1024:.2f} MB"
+
+def make_sample_df(n_pods: int = 3, months: int = 60) -> pd.DataFrame:
+    """Small synthetic sample to demo the app when upload is tricky."""
+    rng = pd.date_range("2019-01-31", periods=months, freq="M")
+    rows = []
+    for i in range(n_pods):
+        pod = f"SAMPLEPOD{i+1:03d}.MEGAFLEX"
+        base = np.linspace(1000, 2000, months) + 200*np.sin(2*np.pi*np.arange(months)/12)
+        noise = 100*np.random.randn(months)
+        off = np.maximum(base + noise, 100)
+        std = np.maximum(base*0.7 + noise*0.8, 50)
+        peak = np.maximum(base*0.4 + noise*0.6, 20)
+        for d, a, b, c in zip(rng, off, std, peak):
+            rows.append([pod, d, a, b, c])
+    sdf = pd.DataFrame(rows, columns=["PodID", "ReportingMonth"] + MEASURES)
+    return sdf
+
 # -----------------------------------------------------------------------------
-# SIDEBAR
+# SIDEBAR – Data source & settings
 # -----------------------------------------------------------------------------
 st.sidebar.title("⚙️ Settings")
-file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
+
+data_source = st.sidebar.radio(
+    "Data source",
+    ["Upload file", "Use sample data"],
+    index=0,
+    help="If upload fails (type/encoding/size), switch to sample data to demo."
+)
+
+uploaded_file = None
+if data_source == "Upload file":
+    uploaded_file = st.sidebar.file_uploader(
+        "Upload CSV / TXT / Excel / zipped CSV",
+        type=["csv", "txt", "xlsx", "xls", "zip"],
+        accept_multiple_files=False,
+        key="uploader_main"
+    )
+else:
+    st.sidebar.success("Using built-in sample dataset.")
+
 test_horizon = st.sidebar.slider("Test horizon (months)", 6, 24, DEFAULT_TEST_HORIZON)
-mask_negatives = st.sidebar.checkbox("Mask negative values", True)
+mask_negatives = st.sidebar.checkbox("Mask negative values", True, help="Treat negatives as missing.")
 ffill_limit = st.sidebar.slider("Short forward/backfill limit", 0, 12, 3)
 
 # -----------------------------------------------------------------------------
-# MAIN
+# MAIN – Load data
 # -----------------------------------------------------------------------------
 st.title("📈 PoD Forecast Playground")
 
-if not file:
-    st.info("Upload `industrial_10yrs.csv` (or your dataset) to proceed.")
-    st.stop()
+# Load the DataFrame depending on data source
+df = None
+if data_source == "Upload file":
+    if not uploaded_file:
+        st.info("⬆️ Upload a file to proceed, or switch to **Use sample data** in the sidebar.")
+        st.stop()
 
-# Load data
-try:
-    df = load_csv(file)
-except Exception as ex:
-    st.error(f"Failed to load CSV: {ex}")
+    # Info about the uploaded file
+    size_info = getattr(uploaded_file, "size", None)
+    name_info = getattr(uploaded_file, "name", "uploaded")
+    st.caption(f"📄 Uploaded: **{name_info}** ({fmt_mb(size_info)})")
+
+    try:
+        content = uploaded_file.getvalue()
+        # Cache by bytes + filename for stable keys
+        raw_df = load_anyfile_cached(content, name_info)
+        df = postload_clean(raw_df)
+    except Exception as ex:
+        st.error(f"❌ Could not load the file: {ex}")
+        st.stop()
+
+else:
+    # Sample data path
+    df = make_sample_df()
+    st.caption("📄 Using a small synthetic sample data set.")
+
+# Basic validation
+if df is None or df.empty:
+    st.error("No rows to display after loading/validation.")
     st.stop()
 
 pods = sorted(df["PodID"].unique().tolist())
@@ -192,6 +333,10 @@ with tab_explore:
         ax.set_xlabel("Month"); ax.set_ylabel("kWh")
         ax.grid(alpha=0.3); ax.legend()
         st.pyplot(fig, clear_figure=True)
+
+        # Small preview
+        with st.expander("Preview first 5 rows"):
+            st.dataframe(monthly.head())
 
 # ==========================
 # MODEL TAB
